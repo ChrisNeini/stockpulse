@@ -298,6 +298,29 @@ let dragStart = null, dragging = false;
 const MO = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez'];
 // ── Session + localStorage Cache ────────────────────────────
 // Verhindert unnötige API-Anfragen (spart das 25/Tag Limit)
+// ── API Request Queue (max 1 Anfrage/Sekunde für Free-Keys) ──
+const _queue = [];
+let _queueRunning = false;
+async function queuedFetch(url){
+  return new Promise((resolve, reject) => {
+    _queue.push({url, resolve, reject});
+    if(!_queueRunning) runQueue();
+  });
+}
+async function runQueue(){
+  _queueRunning = true;
+  while(_queue.length > 0){
+    const {url, resolve, reject} = _queue.shift();
+    try{
+      const r = await fetch(url);
+      resolve(r);
+    }catch(e){ reject(e); }
+    if(_queue.length > 0) await new Promise(r => setTimeout(r, 1300)); // 1.3s Pause
+  }
+  _queueRunning = false;
+}
+
+// ── Session + localStorage Cache (6h) ────────────────────────
 const _cache = {};
 function cacheGet(key){
   // Erst Speicher-Cache
@@ -393,7 +416,7 @@ async function fetchAV(ticker, range){
   if(iv) url += `&interval=${iv}`;
 
   console.log(`AV Anfrage: ${fn} ${sym2} (${range})`);
-  const resp = await fetch(url);
+  const resp = await queuedFetch(url);
   if(!resp.ok) throw new Error(`HTTP ${resp.status} von Alpha Vantage`);
 
   const data = await resp.json();
@@ -402,8 +425,13 @@ async function fetchAV(ticker, range){
   // Alle möglichen Fehlerantworten abfangen
   if(data?.['Error Message'])
     throw new Error(`Ticker '${sym2}' nicht bekannt. Bitte Ticker prüfen.`);
-  if(data?.Note || (data?.Information?.includes('25 requests')))
+  if(data?.Note || data?.Information?.includes('25 requests') || data?.Information?.includes('per se')){
+    // "per se" = "1 request per second" Drosselung
+    const isThrottle = (data?.Note||data?.Information||'').includes('per se') ||
+                       (data?.Note||data?.Information||'').includes('per second');
+    if(isThrottle) throw new Error('Zu viele gleichzeitige Anfragen. Bitte kurz warten und erneut versuchen.');
     throw new Error('Rate-Limit (25/Tag) erreicht. Bitte morgen erneut versuchen.');
+  }
   if(data?.Information?.toLowerCase().includes('premium'))
     throw new Error('Dieser Endpunkt erfordert einen Premium-Key.');
   if(data?.Information)
@@ -447,7 +475,7 @@ async function fetchQuote(ticker){
   try{
     const sym2 = STOCKS[ticker]?.av || ticker;
     const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(sym2)}&apikey=${avKey}`;
-    const r = await fetch(url);
+    const r = await queuedFetch(url);
     const d = await r.json();
     const q = d?.['Global Quote'];
     if(!q||!q['05. price']) return null;
@@ -503,7 +531,14 @@ async function loadChart(ticker, range){
 }
 
 function retryLoad(){
-  if(curTicker){ Object.keys(_cache).forEach(k=>delete _cache[k]); loadChart(curTicker,curRange); }
+  if(curTicker){
+    // Cache leeren und Queue zurücksetzen
+    Object.keys(_cache).forEach(k=>delete _cache[k]);
+    _queue.length = 0;
+    // 2s warten bevor neue Anfrage
+    setTimeout(()=>loadChart(curTicker,curRange), 2000);
+    document.getElementById('errMsg').textContent = 'Bitte warten… (2 Sek.)';
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -864,8 +899,8 @@ function renderWL(){
     d.addEventListener('click',()=>selectStock(t));
     el.appendChild(d);
   });
-  // Live-Quotes
-  if(avKey&&avKey.length>5) watchlist.forEach(updateQuote);
+  // Live-Quotes verzögert laden (nach Chart, um Rate-Limit zu vermeiden)
+  if(avKey&&avKey.length>5) setTimeout(()=>watchlist.forEach(updateQuote), 2000);
 }
 
 async function updateQuote(t){
