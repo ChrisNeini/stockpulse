@@ -276,8 +276,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
     </div>
     <div class="modal-btns">
       <button class="btn-cancel" onclick="closeModal()">Abbrechen</button>
+      <button style="flex:1;padding:10px;border-radius:7px;font-family:var(--mono);font-size:11px;font-weight:700;cursor:pointer;border:none;background:#1e2535;color:var(--acc);border:1px solid var(--acc)" onclick="testKey()">🔍 Key testen</button>
       <button class="btn-save" onclick="saveKey()">✓ Speichern & Laden</button>
     </div>
+    <div id="testResult" style="margin-top:12px;font-family:var(--mono);font-size:10px;line-height:1.7;display:none;padding:10px;border-radius:6px;background:var(--bg)"></div>
   </div>
 </div>
 
@@ -294,7 +296,27 @@ let allCandles = [], viewStart = 0, viewEnd = 0;
 let indicators = {ma50:true, ma200:true, sr:true, rsi:true, ew:false};
 let dragStart = null, dragging = false;
 const MO = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez'];
+// ── Session + localStorage Cache ────────────────────────────
+// Verhindert unnötige API-Anfragen (spart das 25/Tag Limit)
 const _cache = {};
+function cacheGet(key){
+  // Erst Speicher-Cache
+  if(_cache[key]) return _cache[key];
+  // Dann localStorage (6h gültig)
+  try{
+    const raw = localStorage.getItem('sp_cache_'+key);
+    if(raw){
+      const {ts, data} = JSON.parse(raw);
+      if(Date.now()-ts < 6*3600000){ _cache[key]=data; return data; }
+      localStorage.removeItem('sp_cache_'+key);
+    }
+  }catch(e){}
+  return null;
+}
+function cacheSet(key, data){
+  _cache[key] = data;
+  try{ localStorage.setItem('sp_cache_'+key, JSON.stringify({ts:Date.now(), data})); }catch(e){}
+}
 
 const sym  = () => currency==='EUR' ? '€' : '$';
 const conv = v  => currency==='EUR' ? v*USD_EUR : v;
@@ -343,49 +365,61 @@ const STOCKS = {
 // ═══════════════════════════════════════════════════════════
 //  ALPHA VANTAGE API
 // ═══════════════════════════════════════════════════════════
+// ── Alpha Vantage Parameter ─────────────────────────────────
+// WICHTIG: Free-Keys unterstützen NUR outputsize=compact (100 Punkte)
+// outputsize=full und Intraday sind Premium-only!
+// Strategie: Alle Zeiträume über TIME_SERIES_DAILY (compact=100 Tage)
+// bzw. TIME_SERIES_WEEKLY (compact=100 Wochen = ~2 Jahre) abbilden.
 function avParams(range){
+  // Alles über compact — das einzige was Free-Keys zuverlässig liefern
   return {
-    '1D':{fn:'TIME_SERIES_INTRADAY', iv:'5min',  os:'full'},
-    '1W':{fn:'TIME_SERIES_INTRADAY', iv:'60min', os:'full'},
-    '1M':{fn:'TIME_SERIES_DAILY',    iv:null,    os:'compact'},
-    '3M':{fn:'TIME_SERIES_DAILY',    iv:null,    os:'full'},
-    '1Y':{fn:'TIME_SERIES_DAILY',    iv:null,    os:'full'},
-    '5Y':{fn:'TIME_SERIES_WEEKLY',   iv:null,    os:'full'},
+    '1D': {fn:'TIME_SERIES_DAILY',  iv:null, os:'compact'}, // letzte 100 Tage, nimm letzten
+    '1W': {fn:'TIME_SERIES_DAILY',  iv:null, os:'compact'}, // letzte 100 Tage
+    '1M': {fn:'TIME_SERIES_DAILY',  iv:null, os:'compact'}, // letzte 100 Tage
+    '3M': {fn:'TIME_SERIES_DAILY',  iv:null, os:'compact'}, // letzte 100 Tage
+    '1Y': {fn:'TIME_SERIES_DAILY',  iv:null, os:'compact'}, // letzte 100 Tage (ca. 5 Monate)
+    '5Y': {fn:'TIME_SERIES_WEEKLY', iv:null, os:'compact'}, // letzte 100 Wochen = ~2 Jahre
   }[range] || {fn:'TIME_SERIES_DAILY', iv:null, os:'compact'};
 }
 
 async function fetchAV(ticker, range){
-  if(!avKey || avKey.length < 5) throw new Error('Kein API-Key eingetragen. Bitte ⚙ API-Key klicken.');
-  const info = STOCKS[ticker];
-  const sym2 = info?.av || ticker;
+  if(!avKey || avKey.length < 5)
+    throw new Error('Kein API-Key eingetragen. Bitte ⚙ API-Key klicken.');
+
+  const sym2 = STOCKS[ticker]?.av || ticker;
   const {fn, iv, os} = avParams(range);
+
   let url = `https://www.alphavantage.co/query?function=${fn}&symbol=${encodeURIComponent(sym2)}&outputsize=${os}&apikey=${avKey}`;
   if(iv) url += `&interval=${iv}`;
 
+  console.log(`AV Anfrage: ${fn} ${sym2} (${range})`);
   const resp = await fetch(url);
   if(!resp.ok) throw new Error(`HTTP ${resp.status} von Alpha Vantage`);
+
   const data = await resp.json();
+  console.log('AV Antwort-Keys:', Object.keys(data));
 
+  // Alle möglichen Fehlerantworten abfangen
   if(data?.['Error Message'])
-    throw new Error(`Ticker '${sym2}' nicht gefunden. Bitte Ticker prüfen.`);
-  if(data?.Note)
-    throw new Error('API Rate-Limit (25 Anfragen/Tag). Bitte warten und erneut versuchen.');
-  if(data?.Information && data.Information.includes('rate'))
-    throw new Error('API Rate-Limit erreicht.');
+    throw new Error(`Ticker '${sym2}' nicht bekannt. Bitte Ticker prüfen.`);
+  if(data?.Note || (data?.Information?.includes('25 requests')))
+    throw new Error('Rate-Limit (25/Tag) erreicht. Bitte morgen erneut versuchen.');
+  if(data?.Information?.toLowerCase().includes('premium'))
+    throw new Error('Dieser Endpunkt erfordert einen Premium-Key.');
   if(data?.Information)
-    throw new Error(data.Information.substring(0, 120));
+    throw new Error('AV: ' + data.Information.substring(0, 200));
 
+  // Datenschlüssel suchen
   const tsKey = Object.keys(data).find(k =>
     k.includes('Time Series') || k.includes('Weekly') || k.includes('Monthly'));
-  if(!tsKey) throw new Error('Keine Kursdaten in der API-Antwort. Ticker oder Key prüfen.');
+  if(!tsKey){
+    const raw = JSON.stringify(data).substring(0,250);
+    console.error('Unbekannte AV-Antwort:', raw);
+    throw new Error('Keine Kursdaten. API antwortete: ' + raw);
+  }
 
-  const rangeMs = {
-    '1D':2*864e5,'1W':8*864e5,'1M':35*864e5,
-    '3M':100*864e5,'1Y':380*864e5,'5Y':2200*864e5
-  }[range] || 35*864e5;
-  const cutoff = Date.now() - rangeMs;
-
-  const candles = Object.entries(data[tsKey])
+  // Alle Punkte parsen und sortieren (älteste zuerst)
+  const allCandles = Object.entries(data[tsKey])
     .map(([dt,v]) => ({
       ts: new Date(dt).getTime(),
       o: parseFloat(v['1. open']  || 0),
@@ -394,13 +428,18 @@ async function fetchAV(ticker, range){
       c: parseFloat(v['4. close'] || 0),
       v: parseFloat(v['5. volume']|| 0),
     }))
-    .filter(d => d.ts >= cutoff && d.c > 0)
+    .filter(d => d.c > 0)
     .sort((a,b) => a.ts - b.ts);
 
-  if(candles.length < 3)
-    throw new Error(`Zu wenige Datenpunkte erhalten (${candles.length}). Ticker evtl. nicht verfügbar.`);
+  if(allCandles.length < 3)
+    throw new Error(`Nur ${allCandles.length} Datenpunkte. Ticker '${sym2}' evtl. nicht verfügbar.`);
 
-  return candles;
+  // Zeitraum-Filter: zeige passende Anzahl Kerzen je Range
+  const showCount = {'1D':1,'1W':7,'1M':30,'3M':62,'1Y':100,'5Y':100}[range] || 30;
+  const result = allCandles.slice(-showCount);
+
+  console.log(`✓ AV: ${result.length} Kerzen für ${sym2} (${range})`);
+  return result;
 }
 
 async function fetchQuote(ticker){
@@ -437,8 +476,8 @@ async function loadChart(ticker, range){
   allCandles=[];
 
   try{
-    const candles = _cache[ckey] || await fetchAV(ticker, range);
-    _cache[ckey] = candles;
+    const candles = cacheGet(ckey) || await fetchAV(ticker, range);
+    cacheSet(ckey, candles);
     allCandles = candles;
     viewStart=0; viewEnd=allCandles.length;
     document.getElementById('btnReset').style.display='none';
@@ -887,10 +926,55 @@ function openModal(){
   document.getElementById('apiModal').classList.add('open');
 }
 function closeModal(){ document.getElementById('apiModal').classList.remove('open'); }
+async function testKey(){
+  const k = document.getElementById('keyInput').value.trim();
+  const res = document.getElementById('testResult');
+  res.style.display='block';
+  res.style.color='var(--t2)';
+  res.innerHTML='⏳ Teste Verbindung zu Alpha Vantage...';
+  if(!k||k.length<5){
+    res.style.color='var(--red)';
+    res.textContent='✗ Kein Key eingegeben';
+    return;
+  }
+  // Teste 2 Endpunkte: GLOBAL_QUOTE + TIME_SERIES_DAILY
+  const tests = [
+    {label:'GLOBAL_QUOTE', url:`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=NVDA&apikey=${k}`},
+    {label:'TIME_SERIES_DAILY', url:`https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=NVDA&outputsize=compact&apikey=${k}`},
+  ];
+  let html = '';
+  for(const t of tests){
+    try{
+      const r = await fetch(t.url);
+      const d = await r.json();
+      const raw = JSON.stringify(d).substring(0,200);
+      if(d?.['Global Quote']?.['05. price']){
+        html += `<div style="color:#00d4aa">✓ ${t.label}: NVDA = $${d['Global Quote']['05. price']}</div>`;
+      } else if(d?.['Time Series (Daily)']){
+        const dates = Object.keys(d['Time Series (Daily)']);
+        html += `<div style="color:#00d4aa">✓ ${t.label}: ${dates.length} Tage, neuester: ${dates[0]}</div>`;
+      } else if(d?.Note){
+        html += `<div style="color:#f5a623">⚠ ${t.label} Note: ${d.Note.substring(0,120)}</div>`;
+      } else if(d?.Information){
+        html += `<div style="color:#f5a623">⚠ ${t.label} Info: ${d.Information.substring(0,120)}</div>`;
+      } else if(d?.['Error Message']){
+        html += `<div style="color:#ff4d6a">✗ ${t.label}: ${d['Error Message']}</div>`;
+      } else {
+        html += `<div style="color:#ff4d6a">✗ ${t.label} unbekannte Antwort:<br>${raw}</div>`;
+      }
+    }catch(e){
+      html += `<div style="color:#ff4d6a">✗ ${t.label} Verbindungsfehler: ${e.message}</div>`;
+    }
+  }
+  res.innerHTML = html;
+}
+
 function saveKey(){
   const v=document.getElementById('keyInput').value.trim();
   if(v){ avKey=v; localStorage.setItem('sp_key',avKey); }
   Object.keys(_cache).forEach(k=>delete _cache[k]);
+  // Auch localStorage-Cache leeren
+  Object.keys(localStorage).filter(k=>k.startsWith('sp_cache_')).forEach(k=>localStorage.removeItem(k));
   closeModal();
   renderWL();
   if(curTicker) loadChart(curTicker, curRange);
