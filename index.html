@@ -308,16 +308,25 @@ async function queuedFetch(url){
   });
 }
 async function runQueue(){
+  if(_queueRunning) return; // Verhindert doppelten Start
   _queueRunning = true;
-  while(_queue.length > 0){
-    const {url, resolve, reject} = _queue.shift();
-    try{
-      const r = await fetch(url);
-      resolve(r);
-    }catch(e){ reject(e); }
-    if(_queue.length > 0) await new Promise(r => setTimeout(r, 1300)); // 1.3s Pause
+  try{
+    while(_queue.length > 0){
+      const {url, resolve, reject} = _queue.shift();
+      try{
+        const r = await fetch(url);
+        resolve(r);
+      }catch(e){
+        reject(e);
+      }
+      // Pause nur wenn weitere Requests warten (AV: max 5/min)
+      if(_queue.length > 0){
+        await new Promise(r => setTimeout(r, 1300));
+      }
+    }
+  } finally {
+    _queueRunning = false; // IMMER zurücksetzen, auch bei Fehler
   }
-  _queueRunning = false;
 }
 
 // ── Session + localStorage Cache (6h) ────────────────────────
@@ -425,21 +434,24 @@ async function fetchAV(ticker, range){
   // Alle möglichen Fehlerantworten abfangen
   if(data?.['Error Message'])
     throw new Error(`Ticker '${sym2}' nicht bekannt. Bitte Ticker prüfen.`);
-  if(data?.Note || data?.Information?.includes('25 requests') || data?.Information?.includes('per se')){
-    // "per se" = "1 request per second" Drosselung
-    const isThrottle = (data?.Note||data?.Information||'').includes('per se') ||
-                       (data?.Note||data?.Information||'').includes('per second');
-    if(isThrottle) throw new Error('Zu viele gleichzeitige Anfragen. Bitte kurz warten und erneut versuchen.');
-    throw new Error('Rate-Limit (25/Tag) erreicht. Bitte morgen erneut versuchen.');
-  }
-  if(data?.Information?.toLowerCase().includes('premium'))
-    throw new Error('Dieser Endpunkt erfordert einen Premium-Key.');
-  if(data?.Information)
-    throw new Error('AV: ' + data.Information.substring(0, 200));
-
-  // Datenschlüssel suchen
+  // API-Fehler erkennen — NUR wenn KEINE Kursdaten dabei sind
+  // (AV sendet bei Free-Keys manchmal eine Info-Meldung ZUSAMMEN mit Daten)
   const tsKey = Object.keys(data).find(k =>
     k.includes('Time Series') || k.includes('Weekly') || k.includes('Monthly'));
+  const noteMsg = data?.Note || data?.Information || '';
+  if(noteMsg && !tsKey){
+    // Echte Fehler: Note/Information ohne Daten
+    if(noteMsg.includes('25 requests per day') || noteMsg.includes('daily limit'))
+      throw new Error('Tageslimit (25/Tag) erreicht. Morgen früh wieder verfügbar.');
+    if(noteMsg.includes('per second') || noteMsg.includes('sparingly'))
+      throw new Error('Zu viele Anfragen. Bitte 30 Sek. warten → Seite neu laden → erneut versuchen.');
+    if(noteMsg.toLowerCase().includes('premium'))
+      throw new Error('Premium-Endpunkt. Kostenloser Key unterstützt nur TIME_SERIES_DAILY.');
+    throw new Error('AV Meldung: ' + noteMsg.substring(0, 200));
+  }
+  // Info-Meldung IGNORIEREN wenn Daten vorhanden
+
+  // Datenschlüssel (bereits oben berechnet)
   if(!tsKey){
     const raw = JSON.stringify(data).substring(0,250);
     console.error('Unbekannte AV-Antwort:', raw);
@@ -463,7 +475,8 @@ async function fetchAV(ticker, range){
     throw new Error(`Nur ${allCandles.length} Datenpunkte. Ticker '${sym2}' evtl. nicht verfügbar.`);
 
   // Zeitraum-Filter: zeige passende Anzahl Kerzen je Range
-  const showCount = {'1D':1,'1W':7,'1M':30,'3M':62,'1Y':100,'5Y':100}[range] || 30;
+  // Anzahl anzuzeigender Kerzen je Zeitraum
+  const showCount = {'1D':78,'1W':35,'1M':30,'3M':62,'1Y':100,'5Y':100}[range] || 30;
   const result = allCandles.slice(-showCount);
 
   console.log(`✓ AV: ${result.length} Kerzen für ${sym2} (${range})`);
@@ -547,12 +560,11 @@ async function loadChart(ticker, range){
 
 function retryLoad(){
   if(curTicker){
-    // Cache leeren und Queue zurücksetzen
     Object.keys(_cache).forEach(k=>delete _cache[k]);
-    _queue.length = 0;
-    // 2s warten bevor neue Anfrage
-    setTimeout(()=>loadChart(curTicker,curRange), 2000);
-    document.getElementById('errMsg').textContent = 'Bitte warten… (2 Sek.)';
+    _queue.length = 0;        // Queue leeren
+    _queueRunning = false;    // Queue-Status zurücksetzen!
+    document.getElementById('errMsg').textContent = 'Verbinde…';
+    loadChart(curTicker, curRange);
   }
 }
 
@@ -1456,50 +1468,50 @@ async function testKey(){
   const res = document.getElementById('testResult');
   res.style.display='block';
   res.style.color='var(--t2)';
-  res.innerHTML='⏳ Teste Verbindung zu Alpha Vantage...';
+  res.innerHTML='⏳ Teste Key…';
   if(!k||k.length<5){
     res.style.color='var(--red)';
     res.textContent='✗ Kein Key eingegeben';
     return;
   }
-  // Teste 2 Endpunkte: GLOBAL_QUOTE + TIME_SERIES_DAILY
-  const tests = [
-    {label:'GLOBAL_QUOTE', url:`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=NVDA&apikey=${k}`},
-    {label:'TIME_SERIES_DAILY', url:`https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=NVDA&outputsize=compact&apikey=${k}`},
-  ];
-  let html = '';
-  for(const t of tests){
-    try{
-      const r = await fetch(t.url);
-      const d = await r.json();
-      const raw = JSON.stringify(d).substring(0,200);
-      if(d?.['Global Quote']?.['05. price']){
-        html += `<div style="color:#00d4aa">✓ ${t.label}: NVDA = $${d['Global Quote']['05. price']}</div>`;
-      } else if(d?.['Time Series (Daily)']){
-        const dates = Object.keys(d['Time Series (Daily)']);
-        html += `<div style="color:#00d4aa">✓ ${t.label}: ${dates.length} Tage, neuester: ${dates[0]}</div>`;
-      } else if(d?.Note){
-        html += `<div style="color:#f5a623">⚠ ${t.label} Note: ${d.Note.substring(0,120)}</div>`;
-      } else if(d?.Information){
-        html += `<div style="color:#f5a623">⚠ ${t.label} Info: ${d.Information.substring(0,120)}</div>`;
-      } else if(d?.['Error Message']){
-        html += `<div style="color:#ff4d6a">✗ ${t.label}: ${d['Error Message']}</div>`;
-      } else {
-        html += `<div style="color:#ff4d6a">✗ ${t.label} unbekannte Antwort:<br>${raw}</div>`;
-      }
-    }catch(e){
-      html += `<div style="color:#ff4d6a">✗ ${t.label} Verbindungsfehler: ${e.message}</div>`;
+  // Nur TIME_SERIES_DAILY testen (1 Anfrage, kein Queue-Block)
+  try{
+    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=NVDA&outputsize=compact&apikey=${k}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    const noteMsg = d?.Note || d?.Information || '';
+    if(d?.['Time Series (Daily)']){
+      const dates = Object.keys(d['Time Series (Daily)']);
+      const latest = dates[0];
+      const price  = d['Time Series (Daily)'][latest]['4. close'];
+      res.innerHTML = `<div style="color:#00d4aa;font-size:12px;font-weight:700">✓ Key funktioniert!</div>
+        <div style="color:#8890a8;margin-top:4px">NVDA Schlusskurs ${latest}: <b style="color:#e8eaf0">$${parseFloat(price).toFixed(2)}</b></div>
+        <div style="color:#8890a8;margin-top:2px">${dates.length} Handelstage geladen</div>`;
+    } else if(noteMsg.includes('25 requests per day') || noteMsg.includes('daily limit')){
+      res.innerHTML = `<div style="color:#f5a623">⚠ Tageslimit (25/Tag) erreicht</div>
+        <div style="color:#8890a8;margin-top:4px">Dein Key ist gültig, aber das Tageslimit ist aufgebraucht.<br>Morgen früh ist es automatisch zurückgesetzt.</div>`;
+    } else if(noteMsg.includes('sparingly') || noteMsg.includes('per second')){
+      res.innerHTML = `<div style="color:#f5a623">⚠ Zu schnell! Bitte 30s warten</div>
+        <div style="color:#8890a8;margin-top:4px">Key ist gültig — Alpha Vantage braucht kurz.<br>Schließe das Fenster, warte 30 Sekunden, dann lade die Seite neu.</div>`;
+    } else if(d?.['Error Message']){
+      res.innerHTML = `<div style="color:#ff4d6a">✗ Ungültiger Key: ${d['Error Message']}</div>`;
+    } else {
+      res.innerHTML = `<div style="color:#f5a623">⚠ Unbekannte Antwort:</div>
+        <div style="color:#8890a8;font-size:9px;margin-top:4px;word-break:break-all">${JSON.stringify(d).substring(0,200)}</div>`;
     }
+  }catch(e){
+    res.innerHTML = `<div style="color:#ff4d6a">✗ Verbindungsfehler: ${e.message}</div>`;
   }
-  res.innerHTML = html;
 }
 
 function saveKey(){
-  const v=document.getElementById('keyInput').value.trim();
-  if(v){ avKey=v; localStorage.setItem('sp_key',avKey); }
+  const v = document.getElementById('keyInput').value.trim();
+  if(v){ avKey=v; localStorage.setItem('sp_key', avKey); }
+  // Cache + Queue komplett zurücksetzen
   Object.keys(_cache).forEach(k=>delete _cache[k]);
-  // Auch localStorage-Cache leeren
   Object.keys(localStorage).filter(k=>k.startsWith('sp_cache_')).forEach(k=>localStorage.removeItem(k));
+  _queue.length = 0;
+  _queueRunning = false;
   closeModal();
   renderWL();
   if(curTicker) loadChart(curTicker, curRange);
