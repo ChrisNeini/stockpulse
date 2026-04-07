@@ -510,6 +510,21 @@ async function loadChart(ticker, range){
     viewStart=0; viewEnd=allCandles.length;
     document.getElementById('btnReset').style.display='none';
     setDataBadge('live');
+    // MA-Buttons je nach Zeitraum aktivieren/deaktivieren
+    const ma50Avail  = ['1M','3M','1Y','5Y'].includes(range);
+    const ma200Avail = ['3M','1Y','5Y'].includes(range);
+    const b50=document.getElementById('btnMA50');
+    const b200=document.getElementById('btnMA200');
+    if(b50){
+      b50.style.opacity=ma50Avail?'1':'0.35';
+      b50.style.color=(ma50Avail&&indicators.ma50)?'#4f8fff':'var(--t3)';
+      b50.style.borderColor=(ma50Avail&&indicators.ma50)?'#4f8fff':'rgba(255,255,255,.13)';
+    }
+    if(b200){
+      b200.style.opacity=ma200Avail?'1':'0.35';
+      b200.style.color=(ma200Avail&&indicators.ma200)?'#f5a623':'var(--t3)';
+      b200.style.borderColor=(ma200Avail&&indicators.ma200)?'#f5a623':'rgba(255,255,255,.13)';
+    }
 
     const last=allCandles[allCandles.length-1], first=allCandles[0];
     const pct=(last.c-first.o)/first.o*100, isPos=pct>=0;
@@ -591,6 +606,397 @@ function calcSR(data, lb=5){
 // ═══════════════════════════════════════════════════════════
 //  DRAW
 // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  ELLIOTT-WELLEN ANALYSE
+// ═══════════════════════════════════════════════════════════
+
+function findSwings(data,window){
+  const r=[];
+  for(let i=window;i<data.length-window;i++){
+    const sl=data.slice(i-window,i+window+1);
+    const mH=Math.max(...sl.map(d=>d.h)),mL=Math.min(...sl.map(d=>d.l));
+    if(data[i].h===mH)r.push({idx:i,price:data[i].h,type:'high',ts:data[i].ts});
+    else if(data[i].l===mL)r.push({idx:i,price:data[i].l,type:'low',ts:data[i].ts});
+  }
+  const c=[];
+  for(const s of r){const last=c[c.length-1];if(!last||last.type!==s.type)c.push(s);else if(s.type==='high'&&s.price>last.price)c[c.length-1]=s;else if(s.type==='low'&&s.price<last.price)c[c.length-1]=s;}
+  return c;
+}
+
+function detectElliottWaves(data){
+  if(data.length<20)return null;
+  // Swing-Fenster: adaptiv — für alle kurzen Charts window=1 für maximale Swings
+  // window=1 für alle Charts ≤180 Kerzen (1D,1W,1M,3M)
+  // Größere windows nur für 1Y/5Y damit keine Micro-Swings dominieren
+  const swWin = data.length<=90  ? 1 :
+                data.length<=180 ? 1 :
+                data.length<=300 ? 3 :    // 1Y: window=3 statt 10
+                Math.min(12, Math.max(4, Math.floor(data.length/30)));  // 5Y
+  const sw=findSwings(data,swWin);
+  if(sw.length<5)return null;
+
+  // Trendrichtung aus jüngstem Abschnitt
+  // 5J → letzte 3M (62 Kerzen), sonst letzte 30%
+  const recentCount=curRange==='5Y'?62:Math.max(5,Math.floor(data.length*0.3));
+  const recentStart=Math.max(0,data.length-recentCount);
+  const bullish=data[data.length-1].c > data[recentStart].c;
+
+  // Hilfsfunktion: prüft ob eine Swing-Sequenz Elliott-Regeln erfüllt
+  function trySequence(seq, isBull){
+    const need=isBull?['low','high','low','high','low','high']:['high','low','high','low','high','low'];
+    if(!need.slice(0,seq.length).every((t,i)=>t===seq[i].type))return false;
+    if(seq.length>=4){
+      const w1=Math.abs(seq[1].price-seq[0].price);
+      const w3=Math.abs(seq[3].price-seq[2].price);
+      if(w3<w1*.5)return false;         // W3 nie kürzeste
+      if(isBull&&seq[2].price<seq[0].price)return false;  // W2 nie unter W1-Start
+      if(!isBull&&seq[2].price>seq[0].price)return false;
+    }
+    return true;
+  }
+
+  // Suche VON HINTEN — jüngste gültige Sequenz
+  // Probiere BEIDE Richtungen (bull + bear) damit auch dann Wellen gefunden
+  // werden wenn die lokale Richtung vom globalen Trend abweicht
+  let waves=null, wavesBull=false;
+  for(let end=sw.length;end>=5;end--){
+    for(let len=Math.min(6,end);len>=5;len--){
+      const seq=sw.slice(end-len,end);
+      if(seq.length<5)continue;
+      // Versuche zuerst die erkannte Trendrichtung, dann die andere
+      for(const tryBull of [bullish, !bullish]){
+        if(trySequence(seq,tryBull)){
+          waves=seq; wavesBull=tryBull; break;
+        }
+      }
+      if(waves)break;
+    }
+    if(waves)break;
+  }
+  if(!waves)return null;
+  const w1len=Math.abs(waves[1].price-waves[0].price);
+  const w5start=waves[4]?waves[4].price:waves[3].price;
+  const impulseEnd=waves[waves.length-1].price,impulseStart=waves[0].price;
+  const impulseRange=Math.abs(impulseEnd-impulseStart);
+  const phase=waves.length<=2?{label:'Welle 1',num:1}:waves.length<=3?{label:'Welle 2 (Korrektur)',num:2}:waves.length<=4?{label:'Welle 3 (Impuls)',num:3}:waves.length<=5?{label:'Welle 4 (Korrektur)',num:4}:{label:'Welle 5 / A-B-C',num:5};
+  // Trendstärke: 5J → letzte 62 Kerzen (3M), sonst letzte 30
+  const lookbackWin=curRange==='5Y'?Math.min(62,data.length-1):Math.min(30,data.length-1);
+  let up=0,dn=0;
+  for(let i=data.length-lookbackWin;i<data.length;i++){if(data[i].c>data[i-1].c)up++;else dn++;}
+  const trendStrength=up/(up+dn); // 0..1, >0.5 = Aufwärtstrend
+
+  // Wahrscheinlichkeiten aus Wellenphase + Trendstärke
+  // Regel: je weiter der Impuls fortgeschritten (Welle 4/5), desto höher die Korrektur-Wahrsch.
+  const phaseNum=phase.num;
+  let pBull,pBase,pBear;
+
+  if(wavesBull){
+    // Aufwärtstrend
+    if(phaseNum<=2){      pBull=35; pBase=45; pBear=20; }
+    else if(phaseNum===3){pBull=30; pBase=50; pBear=20; }
+    else if(phaseNum===4){pBull=20; pBase=45; pBear=35; }
+    else                 {pBull=15; pBase=35; pBear=50; }
+    // Trendstärke-Boost (letzte 30 Kerzen)
+    const boost=Math.round((trendStrength-0.5)*20);
+    pBull=Math.max(10,Math.min(50,pBull+boost));
+    pBear=Math.max(10,Math.min(60,pBear-boost));
+    pBase=100-pBull-pBear;
+  } else {
+    // Abwärtstrend
+    if(phaseNum<=2){      pBull=20; pBase=45; pBear=35; }
+    else if(phaseNum===3){pBull=20; pBase=50; pBear=30; }
+    else if(phaseNum===4){pBull=35; pBase=45; pBear=20; }
+    else                 {pBull=50; pBase=35; pBear=15; }
+    const boost=Math.round((0.5-trendStrength)*20);
+    pBear=Math.max(10,Math.min(50,pBear+boost));
+    pBull=Math.max(10,Math.min(60,pBull-boost));
+    pBase=100-pBull-pBear;
+  }
+  pBase=Math.max(20,pBase); // Base nie unter 20%
+  // Normieren auf 100%
+  const total=pBull+pBase+pBear;
+  pBull=Math.round(pBull/total*100);
+  pBear=Math.round(pBear/total*100);
+  pBase=100-pBull-pBear;
+
+  return{
+    waves,bullish:wavesBull,
+    currentPhase:phase,
+    targets:{
+      w5_100:bullish?w5start+w1len:w5start-w1len,
+      w5_618:bullish?w5start+w1len*.618:w5start-w1len*.618,
+      corr_618:bullish?impulseEnd-impulseRange*.618:impulseEnd+impulseRange*.618,
+      corr_382:bullish?impulseEnd-impulseRange*.382:impulseEnd+impulseRange*.382,
+    },
+    probabilities:{main:{label:'Base',prob:pBase},bull:pBull,bear:pBear},
+  };
+}
+
+function drawElliottAndForecast(ctx,ew,data,tx,py,W,H,PT,PB,PL,PR,cW,
+                                 lastX,fcastX,priceMain,priceBull,priceBear,priceHi,priceLo,last){
+  const cH=H-PT-PB, s=sym();
+  const clamp=y=>Math.max(PT+2,Math.min(PT+cH-2,y));
+  const N=forecastDays(curRange);
+  const compact=['1M','3M','1Y','5Y'].includes(curRange);
+  const prob=ew?ew.probabilities:{bull:20,main:{prob:55},bear:25};
+  const mainCol=ew&&ew.bullish?'#00d4aa':'#ff4d6a';
+
+  // 1. Elliott-Wellenpfad — dickere Linien, klare Labels, Trendrichtung hervorheben
+  if(ew&&ew.waves&&ew.waves.length>=2){
+    const curIdx=ew.waves.length-1;
+    const wlbl=['0','1','2','3','4','5'];
+    const corrLbl=['A','B','C'];
+    const trendUp=ew.bullish;
+
+    // Verbindungspfad — dicker, gut sichtbar
+    ctx.save();
+    ctx.strokeStyle=trendUp?'rgba(0,212,170,0.8)':'rgba(255,77,106,0.8)';
+    ctx.lineWidth=3; ctx.setLineDash([9,5]);
+    ctx.beginPath(); let ps=false;
+    ew.waves.forEach(w=>{
+      const di=data.findIndex(d=>d.ts>=w.ts), xi=di>=0?di:w.idx-viewStart;
+      if(xi<0||xi>=data.length)return;
+      const x=tx(xi),y=py(conv(w.price));
+      if(!ps){ctx.moveTo(x,y);ps=true;}else ctx.lineTo(x,y);
+    });
+    ctx.stroke(); ctx.setLineDash([]);
+
+    // Richtungspfeile auf dem Pfad
+    ew.waves.forEach((w,i)=>{
+      if(i===0)return;
+      const prev=ew.waves[i-1];
+      const d1=data.findIndex(d=>d.ts>=prev.ts), x1i=d1>=0?d1:prev.idx-viewStart;
+      const d2=data.findIndex(d=>d.ts>=w.ts),    x2i=d2>=0?d2:w.idx-viewStart;
+      if(x1i<0||x2i<0||x1i>=data.length||x2i>=data.length)return;
+      const x1=tx(x1i),y1=py(conv(prev.price)),x2=tx(x2i),y2=py(conv(w.price));
+      const ax=x1+(x2-x1)*.65, ay=y1+(y2-y1)*.65;
+      const angle=Math.atan2(y2-y1,x2-x1), al=9;
+      ctx.save();
+      ctx.strokeStyle=trendUp?'rgba(0,212,170,0.6)':'rgba(255,77,106,0.6)';
+      ctx.lineWidth=2;
+      ctx.beginPath();
+      ctx.moveTo(ax-Math.cos(angle-0.38)*al,ay-Math.sin(angle-0.38)*al);
+      ctx.lineTo(ax,ay);
+      ctx.lineTo(ax-Math.cos(angle+0.38)*al,ay-Math.sin(angle+0.38)*al);
+      ctx.stroke(); ctx.restore();
+    });
+    ctx.restore();
+
+    // Wellenpunkte
+    ew.waves.forEach((w,i)=>{
+      const di=data.findIndex(d=>d.ts>=w.ts), xi=di>=0?di:w.idx-viewStart;
+      if(xi<0||xi>=data.length)return;
+      const x=tx(xi), y=py(conv(w.price));
+      const isCur=(i===curIdx), isHigh=(w.type==='high');
+      const lbl=ew.currentPhase.num>=5&&i>=4?(corrLbl[i-4]||wlbl[i]):(wlbl[i]||String(i));
+      const r=isCur?12:9;
+
+      // Glow beim aktuellen
+      if(isCur){
+        ctx.save();
+        ctx.fillStyle=trendUp?'rgba(0,212,170,0.18)':'rgba(255,77,106,0.18)';
+        ctx.beginPath(); ctx.arc(x,y,r+10,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+
+      // Kreis — gefüllt mit Farbe
+      ctx.save();
+      ctx.fillStyle=isCur?mainCol:(trendUp?'rgba(0,212,170,0.25)':'rgba(255,77,106,0.25)');
+      ctx.strokeStyle=trendUp?'#00d4aa':'#ff4d6a';
+      ctx.lineWidth=isCur?2.5:2;
+      ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); ctx.stroke();
+
+      // Pulsring
+      if(isCur){
+        ctx.strokeStyle='rgba(255,255,255,0.4)'; ctx.lineWidth=1.5; ctx.setLineDash([3,4]);
+        ctx.beginPath(); ctx.arc(x,y,r+7,0,Math.PI*2); ctx.stroke(); ctx.setLineDash([]);
+      }
+
+      // Nummer im Kreis
+      ctx.fillStyle=isCur?'#000':(trendUp?'#00d4aa':'#ff4d6a');
+      ctx.font=`bold ${isCur?14:12}px Space Mono,monospace`;
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(lbl,x,y);
+      ctx.restore();
+
+      // Preis-Label
+      ctx.save();
+      ctx.fillStyle=isCur?'rgba(255,255,255,0.9)':'rgba(255,255,255,0.5)';
+      ctx.font=`${isCur?'bold ':''}9px Space Mono,monospace`;
+      ctx.textAlign='center'; ctx.textBaseline=isHigh?'bottom':'top';
+      ctx.fillText(`${s}${conv(w.price).toFixed(2)}`,x,isHigh?y-r-5:y+r+5);
+      ctx.restore();
+
+      // Aktuelle Welle: Phase-Tag
+      if(isCur){
+        ctx.save();
+        const tag=ew.currentPhase.label;
+        const metrics=ctx.measureText(tag);
+        const tw=metrics.width+18, th=20;
+        const bx=x-tw/2, by=isHigh?y-r-32:y+r+10;
+        ctx.fillStyle='rgba(8,11,22,0.93)'; ctx.strokeStyle=mainCol; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.roundRect(bx,by,tw,th,5); ctx.fill(); ctx.stroke();
+        ctx.fillStyle=mainCol; ctx.font='bold 10px Space Mono,monospace';
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(tag,x,by+th/2);
+        ctx.restore();
+      }
+    });
+
+    // Elliott-Ziellinien nur bei kurzen Zeiträumen
+    if(!compact){
+      const tg=ew.targets;
+      const dfl=(pUSD,lbl,rgb,a)=>{
+        const y=py(conv(pUSD)); if(y<PT||y>PT+cH)return;
+        ctx.save(); ctx.strokeStyle=`rgba(${rgb},${a})`; ctx.lineWidth=1; ctx.setLineDash([4,5]);
+        ctx.beginPath(); ctx.moveTo(PL+8,y); ctx.lineTo(PL+cW-4,y); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle=`rgba(${rgb},${a+.15})`; ctx.font='9px Space Mono,monospace';
+        ctx.textAlign='left'; ctx.textBaseline='bottom';
+        ctx.fillText(`${lbl}  ${s}${conv(pUSD).toFixed(2)}`,PL+10,y-2); ctx.restore();
+      };
+      if(ew.currentPhase.num<=4){dfl(tg.w5_100,'W5-100%','0,212,170',.4);dfl(tg.w5_618,'W5-61.8%','0,212,170',.25);}
+      dfl(tg.corr_618,'Korr-61.8%','255,77,106',.35); dfl(tg.corr_382,'Korr-38.2%','245,166,35',.35);
+    }
+  }
+
+
+  // 2. Trennlinie Heute
+  ctx.save();
+  ctx.strokeStyle='rgba(255,255,255,0.18)'; ctx.lineWidth=1; ctx.setLineDash([3,4]);
+  ctx.beginPath(); ctx.moveTo(lastX,PT); ctx.lineTo(lastX,PT+cH); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle='rgba(255,255,255,0.4)'; ctx.font='9px Space Mono,monospace';
+  ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillText('Heute',lastX,PT+5);
+  ctx.restore();
+
+  // 3. Prognose
+  const nSteps=14;
+  const fPath=tUSD=>{
+    const pts=[];
+    for(let i=0;i<=nSteps;i++){
+      const t=i/nSteps, x=lastX+(fcastX-lastX)*t;
+      pts.push({x,y:clamp(py(conv(last.c+(tUSD-last.c)*t*t*(3-2*t))))});
+    }
+    return pts;
+  };
+  const ptsMain=fPath(priceMain), ptsBull=fPath(priceBull), ptsBear=fPath(priceBear);
+
+  if(compact){
+    // KOMPAKT: dezentes Band + nur Hauptlinie, kein Min/Max
+    const ptsHi=fPath(priceHi), ptsLo=fPath(priceLo);
+    ctx.save();
+    ctx.beginPath();
+    ptsHi.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+    ptsLo.slice().reverse().forEach(p=>ctx.lineTo(p.x,p.y));
+    ctx.closePath(); ctx.fillStyle='rgba(167,139,250,0.05)'; ctx.fill();
+    ctx.restore();
+    // Hauptlinie (Hauptszenario)
+    ctx.save();
+    ctx.strokeStyle=ew&&ew.bullish?'rgba(0,212,170,0.95)':'rgba(255,77,106,0.95)';
+    ctx.lineWidth=2.5;
+    ctx.beginPath(); ptsMain.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+    ctx.stroke(); ctx.restore();
+    // Kein Endpunkt-Marker im Chart — Werte nur in Info-Box
+  } else {
+    // VOLLSTÄNDIG: 1D + 1W
+    const ptsHi=fPath(priceHi), ptsLo=fPath(priceLo);
+    ctx.save();
+    const fb=(a,b,col)=>{ctx.beginPath();a.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));b.slice().reverse().forEach(p=>ctx.lineTo(p.x,p.y));ctx.closePath();ctx.fillStyle=col;ctx.fill();};
+    fb(ptsHi,ptsLo,'rgba(167,139,250,0.07)');
+    fb(ptsBull,ptsMain,'rgba(0,212,170,0.1)');
+    fb(ptsMain,ptsBear,'rgba(255,77,106,0.08)');
+    ctx.restore();
+    const dL=(pts,col,dash,lw)=>{ctx.save();ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.setLineDash(dash);ctx.beginPath();pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));ctx.stroke();ctx.setLineDash([]);ctx.restore();};
+    dL(ptsHi,'rgba(167,139,250,0.3)',[2,5],.8); dL(ptsLo,'rgba(167,139,250,0.3)',[2,5],.8);
+    dL(ptsBear,'rgba(255,77,106,0.85)',[6,4],2); dL(ptsBull,'rgba(0,212,170,0.85)',[6,4],2);
+    dL(ptsMain,mainCol,[],3);
+    const dE=(pts,pUSD,col,lbl,pct)=>{
+      const p=pts[pts.length-1]; if(!p)return;
+      ctx.save(); ctx.fillStyle=col; ctx.beginPath(); ctx.arc(p.x,p.y,5,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='rgba(10,13,20,0.9)'; ctx.beginPath(); ctx.arc(p.x,p.y,2.5,0,Math.PI*2); ctx.fill();
+      const bw=88,bh=32,bx=Math.min(p.x+7,W-PR-bw-2),by=clamp(p.y-bh/2);
+      ctx.fillStyle='rgba(10,13,20,0.9)'; ctx.strokeStyle=col; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,5); ctx.fill(); ctx.stroke();
+      ctx.fillStyle=col; ctx.font='bold 10px Space Mono,monospace'; ctx.textAlign='left'; ctx.textBaseline='top';
+      ctx.fillText(`${s}${conv(pUSD).toFixed(2)}`,bx+5,by+5);
+      ctx.fillStyle='rgba(255,255,255,0.4)'; ctx.font='9px Space Mono,monospace';
+      ctx.fillText(`${lbl}  ${pct}%`,bx+5,by+19); ctx.restore();
+    };
+    // Kein Endpunkt-Marker im Chart — Werte nur in Info-Box
+  }
+
+  // 4. Zeithorizont-Label
+  ctx.save();
+  const dN=new Date(last.ts+N*86400000);
+  ctx.fillStyle='rgba(255,255,255,0.22)'; ctx.font='9px Space Mono,monospace';
+  ctx.textAlign='center'; ctx.textBaseline='top';
+  ctx.fillText(`${forecastLabel(curRange)} ${dN.getDate()}. ${MO[dN.getMonth()]}`,fcastX,PT+cH+5);
+  ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.lineWidth=1; ctx.setLineDash([2,4]);
+  ctx.beginPath(); ctx.moveTo(fcastX,PT); ctx.lineTo(fcastX,PT+cH); ctx.stroke();
+  ctx.setLineDash([]); ctx.restore();
+
+  // 5. Info-Box: Trendrichtung + aktuelle Phase klar benennen
+  const pl=ew?ew.currentPhase.label:'Trend-Prognose';
+  const trendIcon=ew&&ew.bullish?'▲ AUFWÄRTSTREND':'▼ ABWÄRTSTREND';
+  const trendColBox=ew&&ew.bullish?'rgba(0,212,170,0.12)':'rgba(255,77,106,0.12)';
+  const box={x:PL+8,y:PT+8,w:258,h:118};
+  ctx.save();
+  ctx.fillStyle='rgba(8,11,22,0.95)'; ctx.strokeStyle=mainCol; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.roundRect(box.x,box.y,box.w,box.h,7); ctx.fill(); ctx.stroke();
+
+  // Trendrichtungs-Banner oben
+  ctx.fillStyle=trendColBox;
+  ctx.beginPath(); ctx.roundRect(box.x,box.y,box.w,22,{upperLeft:7,upperRight:7,lowerLeft:0,lowerRight:0}); ctx.fill();
+  ctx.fillStyle=mainCol; ctx.font='bold 11px Space Mono,monospace';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(trendIcon,box.x+box.w/2,box.y+11);
+
+  // Trennlinie
+  ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(box.x+8,box.y+22); ctx.lineTo(box.x+box.w-8,box.y+22); ctx.stroke();
+
+  // Phase + Prognose-Horizont
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillStyle='#8890a8'; ctx.font='9px Space Mono,monospace';
+  ctx.fillText('Aktuelle Welle',box.x+9,box.y+27);
+  ctx.fillStyle=mainCol; ctx.font='bold 11px Space Mono,monospace';
+  ctx.fillText(pl,box.x+9,box.y+39);
+
+  // Prognosehorizont rechts
+  ctx.fillStyle='rgba(255,255,255,0.3)'; ctx.font='9px Space Mono,monospace';
+  ctx.textAlign='right';
+  ctx.fillText(forecastLabel(curRange),box.x+box.w-9,box.y+27);
+  ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.font='bold 10px Space Mono,monospace';
+  const dN2=new Date(last.ts+N*86400000);
+  ctx.fillText(`${dN2.getDate()}. ${MO[dN2.getMonth()]}`,box.x+box.w-9,box.y+39);
+
+  // Wahrscheinlichkeit Basis-Szenario
+  ctx.textAlign='left';
+  // Wahrscheinlichkeiten mit Preiszielen + Balken
+  const rows=[
+    {col:'#00d4aa', txt:`Bull  ${s}${conv(priceBull).toFixed(2)}`, pct:prob.bull},
+    {col:mainCol,   txt:`Base  ${s}${conv(priceMain).toFixed(2)}`, pct:prob.main.prob},
+    {col:'#ff4d6a', txt:`Bar   ${s}${conv(priceBear).toFixed(2)}`,  pct:prob.bear},
+  ];
+  rows.forEach((r,i)=>{
+    const ry=box.y+59+i*20;
+    // Szenario-Label + Preis
+    ctx.fillStyle=r.col; ctx.font='bold 10px Space Mono,monospace';
+    ctx.textAlign='left'; ctx.textBaseline='top';
+    ctx.fillText(r.txt,box.x+9,ry+2);
+    // Wahrscheinlichkeits-Balken rechts
+    const barX=box.x+box.w-58, barW=44, barH=10;
+    ctx.fillStyle='rgba(255,255,255,0.07)';
+    ctx.beginPath(); ctx.roundRect(barX,ry+2,barW,barH,3); ctx.fill();
+    ctx.fillStyle=r.col;
+    ctx.beginPath(); ctx.roundRect(barX,ry+2,Math.max(4,barW*r.pct/100),barH,3); ctx.fill();
+    // Prozentzahl
+    ctx.fillStyle='rgba(255,255,255,0.55)'; ctx.font='9px Space Mono,monospace';
+    ctx.textAlign='right'; ctx.textBaseline='top';
+    ctx.fillText(`${r.pct}%`,box.x+box.w-6,ry+3);
+  });
+  ctx.restore();
+}
+
 function redraw(){
   const data = allCandles.slice(viewStart, viewEnd);
   if(!data.length) return;
@@ -607,119 +1013,187 @@ function redraw(){
 
 function drawCandles(data){
   const wrap=document.getElementById('candleWrap');
-  const cv=document.getElementById('candleCanvas');
+  const canvas=document.getElementById('candleCanvas');
   const dpr=window.devicePixelRatio||1;
-  const W=wrap.clientWidth, H=wrap.clientHeight;
-  if(!W||!H) return;
-  cv.width=W*dpr; cv.height=H*dpr;
-  cv.style.width=W+'px'; cv.style.height=H+'px';
-  const ctx=cv.getContext('2d'); ctx.scale(dpr,dpr);
+  const W=wrap.clientWidth,H=wrap.clientHeight;
+  if(W<=0||H<=0)return;
+  canvas.width=W*dpr;canvas.height=H*dpr;
+  canvas.style.width=W+'px';canvas.style.height=H+'px';
+  const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);
 
-  const PL=8, PR=62, PT=12, PB=24;
-  const cW=W-PL-PR, cH=H-PT-PB;
+  // Feste Achse — Elliott-Forecast ändert die Chart-Breite NICHT
+  const PL=10,PR=62,PT=14,PB=28;
+  const totalCW=W-PL-PR;
+  const cW=totalCW;  // immer volle Breite, unabhängig von Elliott
+  const cH=H-PT-PB;
 
-  // MAs
-  const ma50all  = calcMA(allCandles,50);
-  const ma200all = calcMA(allCandles,200);
-  const slMA50   = ma50all.slice(viewStart,viewEnd);
-  const slMA200  = ma200all.slice(viewStart,viewEnd);
-  const srLevels = indicators.sr ? calcSR(allCandles) : [];
+  const ma50all=calcMA(allCandles,50),ma200all=calcMA(allCandles,200);
+  const srLevels=indicators.sr?calcSR(allCandles):[];
+  const slMA50=ma50all.slice(viewStart,viewEnd),slMA200=ma200all.slice(viewStart,viewEnd);
 
-  // Y range
-  let minP=Infinity, maxP=-Infinity;
-  data.forEach(d=>{minP=Math.min(minP,d.l);maxP=Math.max(maxP,d.h);});
-  if(indicators.ma50&&curRange==='1Y'||curRange==='5Y')
-    slMA50.forEach(v=>{if(v){minP=Math.min(minP,v);maxP=Math.max(maxP,v);}});
-  if(indicators.ma200&&curRange==='5Y')
-    slMA200.forEach(v=>{if(v){minP=Math.min(minP,v);maxP=Math.max(maxP,v);}});
-  const pad=(maxP-minP)*.08; minP-=pad; maxP+=pad;
+  // Prognose vorab berechnen für Y-Skalierung
+  let ewData=null,pMain=0,pBull=0,pBear=0,pHi=0,pLo=0;
+  if(indicators.ew&&data.length>=20){
+    ewData=detectElliottWaves(data);
+    // Lookback: 5J → letzte 3M (62 Kerzen), sonst letzte 40 Kerzen
+    const lookback=curRange==='5Y'?62:40;
+    const rec=data.slice(Math.max(0,data.length-lookback));
+    const rets=rec.slice(1).map((d,i)=>(d.c-rec[i].c)/rec[i].c);
+    const mR=rets.reduce((s,r)=>s+r,0)/rets.length;
+    const vR=rets.reduce((s,r)=>s+(r-mR)**2,0)/rets.length;
+    const vol=Math.sqrt(vR);
+    const N=forecastDays(curRange);
+    const bull=ewData?ewData.bullish:data[data.length-1].c>data[0].c;
+    // Annualisierter Drift: täglicher Mittelwert * Handelstage
+    // Base-Szenario: moderater Drift in Trendrichtung
+    const absDrift=Math.abs(mR);
+    const baseDrift=bull?Math.max(mR,absDrift*0.4):Math.min(mR,-absDrift*0.4);
+    const last=data[data.length-1];
+    // Base = Trendfortsetzung mit moderatem Drift
+    pMain=last.c*Math.exp(baseDrift*N);
+    // Bull = starker Aufwärtsdrift (+1σ zusätzlich)
+    pBull=last.c*Math.exp((baseDrift+vol*0.9)*N);
+    // Bär = Gegendrift (-1.5σ)
+    pBear=last.c*Math.exp((baseDrift-vol*1.5)*N);
+    // 90%-Konfidenzgrenzen
+    pHi=last.c*Math.exp(baseDrift*N+vol*Math.sqrt(N)*1.282);
+    pLo=last.c*Math.exp(baseDrift*N-vol*Math.sqrt(N)*1.282);
+  }
+
+  // Y-Bereich — NUR aus Kerzen + MAs, NICHT aus Prognose-Preisen
+  // Die Y-Achse bleibt dadurch konstant egal ob Elliott an/aus ist
+  let minP=Infinity,maxP=-Infinity;
+  data.forEach(d=>{minP=Math.min(minP,conv(d.l));maxP=Math.max(maxP,conv(d.h));});
+  // MA50 ab 1M, MA200 ab 3M in Y-Range einbeziehen
+  if(indicators.ma50  && ['1M','3M','1Y','5Y'].includes(curRange)) slMA50.forEach(v=>{if(v!=null){minP=Math.min(minP,conv(v));maxP=Math.max(maxP,conv(v));}});
+  if(indicators.ma200 && ['3M','1Y','5Y'].includes(curRange))      slMA200.forEach(v=>{if(v!=null){minP=Math.min(minP,conv(v));maxP=Math.max(maxP,conv(v));}});
+  const pad=(maxP-minP)*.08;minP-=pad;maxP+=pad;
   const rng=maxP-minP||1;
 
   const py=p=>PT+cH*(1-(p-minP)/rng);
   const tx=i=>PL+(i+.5)*(cW/data.length);
   const cw=Math.max(1,cW/data.length*.65);
 
-  // BG + Grid
-  ctx.fillStyle='#0a0d14'; ctx.fillRect(0,0,W,H);
-  ctx.strokeStyle='rgba(255,255,255,.04)'; ctx.lineWidth=1;
+  // Hintergrund
+  ctx.fillStyle='#0a0d14';ctx.fillRect(0,0,W,H);
+  // kein Forecast-Overlay (Achse bleibt konstant)
+
+  // Grid
+  ctx.strokeStyle='rgba(255,255,255,0.04)';ctx.lineWidth=1;
   for(let i=0;i<=5;i++){const y=PT+(cH/5)*i;ctx.beginPath();ctx.moveTo(PL,y);ctx.lineTo(W-PR,y);ctx.stroke();}
 
   // S/R
-  if(indicators.sr) srLevels.forEach(lv=>{
-    const lp=conv(lv.price), y=py(conv(lv.price));
-    if(y<PT||y>PT+cH) return;
-    ctx.save();
-    ctx.strokeStyle=lv.type==='sup'?'rgba(0,212,170,.4)':'rgba(192,132,252,.4)';
-    ctx.lineWidth=1.2; ctx.setLineDash([5,4]);
-    ctx.beginPath(); ctx.moveTo(PL,y); ctx.lineTo(W-PR,y); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle=lv.type==='sup'?'rgba(0,212,170,.7)':'rgba(192,132,252,.7)';
-    ctx.font='9px Space Mono,monospace'; ctx.textAlign='left'; ctx.textBaseline='bottom';
-    ctx.fillText(sym()+conv(lv.price).toFixed(2),W-PR+4,y+1);
-    ctx.restore();
+  if(indicators.sr)srLevels.forEach(lv=>{
+    const lp=conv(lv.price),y=py(lp);
+    if(y<PT||y>PT+cH)return;
+    ctx.save();ctx.strokeStyle=lv.type==='support'?'rgba(0,212,170,0.4)':'rgba(192,132,252,0.4)';
+    ctx.lineWidth=1.5;ctx.setLineDash([5,4]);ctx.beginPath();ctx.moveTo(PL,y);ctx.lineTo(W-PR,y);ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle=lv.type==='support'?'rgba(0,212,170,0.75)':'rgba(192,132,252,0.75)';
+    ctx.font='9px Space Mono,monospace';ctx.textAlign='left';ctx.textBaseline='bottom';
+    ctx.fillText(sym()+lp.toFixed(2),W-PR+4,y+1);ctx.restore();
   });
 
-  // MA 200 (nur 5Y)
-  if(indicators.ma200 && curRange==='5Y'){
-    ctx.strokeStyle='#f5a623'; ctx.lineWidth=1.6; ctx.setLineDash([]);
-    ctx.beginPath(); let s200=false;
-    slMA200.forEach((v,i)=>{
-      if(!v){s200=false;return;}
-      const x=tx(i),y=py(conv(v));
-      if(!s200){ctx.moveTo(x,y);s200=true;}else ctx.lineTo(x,y);
-    });
-    ctx.stroke();
-    const lv=slMA200.filter(v=>v!==null).pop();
-    document.getElementById('oMA200').textContent=lv?fmt(lv,2):'—';
-  } else { document.getElementById('oMA200').textContent='—'; }
+  // Fibonacci Retracements
+  if(indicators.ew)drawFibonacci(ctx,data,tx,py,W,PT,PL,PR,cW,cH);
 
-  // MA 50 (1Y + 5Y)
-  if(indicators.ma50 && (curRange==='1Y'||curRange==='5Y')){
-    ctx.strokeStyle='#4f8fff'; ctx.lineWidth=1.6; ctx.setLineDash([]);
-    ctx.beginPath(); let s50=false;
-    slMA50.forEach((v,i)=>{
-      if(!v){s50=false;return;}
-      const x=tx(i),y=py(conv(v));
-      if(!s50){ctx.moveTo(x,y);s50=true;}else ctx.lineTo(x,y);
-    });
-    ctx.stroke();
-    const lv=slMA50.filter(v=>v!==null).pop();
-    document.getElementById('oMA50').textContent=lv?fmt(lv,2):'—';
-  } else { document.getElementById('oMA50').textContent='—'; }
+  // MA 200 — nur im 5J-Chart sinnvoll (200 Tageskerzen nötig)
+  if(showMA200){
+    const has=slMA200.some(v=>v!==null);
+    if(!has){ctx.fillStyle='rgba(245,166,35,0.35)';ctx.font='10px Space Mono,monospace';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('MA 200: mind. 5J Daten benötigt',PL+cW/2,PT+20);}
+    else{ctx.strokeStyle='#f5a623';ctx.lineWidth=1.8;ctx.beginPath();let st=false;slMA200.forEach((v,i)=>{if(!v){st=false;return;}const x=tx(i),y=py(conv(v));if(!st){ctx.moveTo(x,y);st=true;}else ctx.lineTo(x,y);});ctx.stroke();}
+  }
+  // MA 50 — nur im 1J- und 5J-Chart
+  if(showMA50){
+    const has=slMA50.some(v=>v!==null);
+    if(!has){ctx.fillStyle='rgba(79,143,255,0.35)';ctx.font='10px Space Mono,monospace';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('MA 50: zu wenig Daten',PL+cW/2,PT+36);}
+    else{ctx.strokeStyle='#4f8fff';ctx.lineWidth=1.8;ctx.beginPath();let st=false;slMA50.forEach((v,i)=>{if(!v){st=false;return;}const x=tx(i),y=py(conv(v));if(!st){ctx.moveTo(x,y);st=true;}else ctx.lineTo(x,y);});ctx.stroke();}
+  }
 
   // Y-Achse
-  ctx.fillStyle='#545d75'; ctx.font='9px Space Mono,monospace';
-  ctx.textAlign='left'; ctx.textBaseline='middle';
-  for(let i=0;i<=5;i++){
-    const p=minP+(rng/5)*i, y=PT+cH*(1-i/5);
-    ctx.fillText(sym()+conv(p).toFixed(p<10?2:0),W-PR+5,y);
-  }
+  ctx.fillStyle='#545d75';ctx.font='10px Space Mono,monospace';ctx.textAlign='left';ctx.textBaseline='middle';
+  for(let i=0;i<=5;i++){const p=minP+(rng/5)*i,y=PT+cH*(1-i/5);ctx.fillText(sym()+p.toFixed(p<10?2:0),W-PR+5,y);}
 
   // X-Achse
-  ctx.textAlign='center'; ctx.textBaseline='top';
-  const step=Math.max(1,Math.floor(data.length/7));
-  for(let i=0;i<data.length;i+=step){
-    ctx.fillText(fmtDate(new Date(data[i].ts)),tx(i),H-PB+4);
-  }
+  ctx.textAlign='center';ctx.textBaseline='top';
+  const xlc=Math.min(8,data.length),step=Math.max(1,Math.floor(data.length/xlc));
+  for(let i=0;i<data.length;i+=step)ctx.fillText(fmtDate(new Date(data[i].ts),curRange),tx(i),H-PB+5);
 
   // Kerzen
   data.forEach((d,i)=>{
-    const x=tx(i), up=d.c>=d.o, col=up?'#00d4aa':'#ff4d6a';
+    const x=tx(i),up=d.c>=d.o,col=up?'#00d4aa':'#ff4d6a';
     const dO=conv(d.o),dC=conv(d.c),dH=conv(d.h),dL=conv(d.l);
-    ctx.strokeStyle=col; ctx.lineWidth=Math.max(1,cw*.12);
-    ctx.beginPath(); ctx.moveTo(x,py(dH)); ctx.lineTo(x,py(dL)); ctx.stroke();
-    const top=py(Math.max(dO,dC)), bot=py(Math.min(dO,dC));
-    ctx.fillStyle=col; ctx.fillRect(x-cw/2,top,cw,Math.max(1,bot-top));
+    ctx.strokeStyle=col;ctx.lineWidth=Math.max(1,cw*.13);
+    ctx.beginPath();ctx.moveTo(x,py(dH));ctx.lineTo(x,py(dL));ctx.stroke();
+    const top=py(Math.max(dO,dC)),bot=py(Math.min(dO,dC));
+    ctx.fillStyle=col;ctx.fillRect(x-cw/2,top,cw,Math.max(1,bot-top));
   });
 
-  // Preis-Marker
+  // OHLC + MA
   const last=data[data.length-1];
-  const cy=py(conv(last.c)), isUp=last.c>=data[0].c;
-  ctx.fillStyle=isUp?'#00d4aa':'#ff4d6a';
-  ctx.fillRect(W-PR,cy-9,PR-2,18);
-  ctx.fillStyle='#000'; ctx.font='bold 9px Space Mono,monospace';
-  ctx.textAlign='center'; ctx.textBaseline='middle';
-  ctx.fillText(sym()+conv(last.c).toFixed(2),W-PR+(PR-2)/2,cy);
+  const lMA50=slMA50[slMA50.length-1],lMA200=slMA200[slMA200.length-1];
+  // MA-Werte in OHLC-Bar anzeigen (gleiche Range-Logik wie Zeichnung)
+  const showMA50ohlc  = indicators.ma50  && ['1M','3M','1Y','5Y'].includes(curRange);
+  const showMA200ohlc = indicators.ma200 && ['3M','1Y','5Y'].includes(curRange);
+  document.getElementById('oMA50').textContent=(showMA50ohlc&&lMA50!=null)?fmt(lMA50,2):'—';
+  document.getElementById('oMA200').textContent=(showMA200ohlc&&lMA200!=null)?fmt(lMA200,2):'—';
+
+  // Preis-Marker
+  const curY=py(conv(last.c)),isUp=last.c>=data[0].c;
+  ctx.fillStyle=isUp?'#00d4aa':'#ff4d6a';ctx.fillRect(W-PR,curY-9,PR-2,18);
+  ctx.fillStyle='#000';ctx.font='bold 10px Space Mono,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(sym()+conv(last.c).toFixed(2),W-PR+(PR-2)/2,curY);
+
+  // Elliott + Forecast
+  if(indicators.ew&&data.length>=20){
+    const lastX=tx(data.length-1);
+    // Prognose-Fächer: 28% der Kerzen-Breite rechts vom letzten Punkt
+    const fcastX=Math.min(W-PR-4, lastX+cW*0.28);
+    drawElliottAndForecast(ctx,ewData,data,tx,py,W,H,PT,PB,PL,PR,cW,lastX,fcastX,pMain,pBull,pBear,pHi,pLo,last);
+  }
+}
+function drawFibonacci(ctx,data,tx,py,W,PT,PL,PR,cW,cH){
+  if(data.length<5)return;
+  let hiIdx=0,loIdx=0;
+  data.forEach((d,i)=>{if(d.h>data[hiIdx].h)hiIdx=i;if(d.l<data[loIdx].l)loIdx=i;});
+  const hi=conv(data[hiIdx].h),lo=conv(data[loIdx].l),range=hi-lo;
+  if(range<=0)return;
+  const bullRetrace=loIdx<hiIdx;
+  const from=bullRetrace?hi:lo,to=bullRetrace?lo:hi;
+  const fibs=[
+    {r:0,     lbl:'0%',    col:'rgba(255,255,255,0.18)',lw:1},
+    {r:.236,  lbl:'23.6%', col:'rgba(245,166,35,0.6)', lw:1},
+    {r:.382,  lbl:'38.2%', col:'rgba(0,212,170,0.65)', lw:1.5},
+    {r:.500,  lbl:'50%',   col:'rgba(167,139,250,0.6)',lw:1},
+    {r:.618,  lbl:'61.8%', col:'rgba(0,212,170,0.85)', lw:2},
+    {r:.786,  lbl:'78.6%', col:'rgba(245,166,35,0.5)', lw:1},
+    {r:1,     lbl:'100%',  col:'rgba(255,255,255,0.18)',lw:1},
+  ];
+  // Swing-Punkte markieren
+  ctx.save();
+  const xHi=tx(hiIdx),xLo=tx(loIdx);
+  ctx.fillStyle='rgba(255,255,255,0.3)';
+  ctx.beginPath();ctx.arc(xHi,py(hi),3,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(xLo,py(lo),3,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.06)';ctx.lineWidth=1;ctx.setLineDash([2,4]);
+  ctx.beginPath();ctx.moveTo(xHi,py(hi));ctx.lineTo(xLo,py(lo));ctx.stroke();
+  ctx.setLineDash([]);ctx.restore();
+
+  fibs.forEach(({r,lbl,col,lw})=>{
+    const price=from-(from-to)*r,y=py(price);
+    if(y<PT||y>PT+cH)return;
+    ctx.save();
+    ctx.strokeStyle=col;ctx.lineWidth=lw;
+    ctx.setLineDash(r===0||r===1?[]:[5,4]);
+    ctx.beginPath();
+    const xStart=Math.min(xHi,xLo);
+    ctx.moveTo(xStart,y);ctx.lineTo(W-PR-2,y);ctx.stroke();
+    ctx.setLineDash([]);
+    const colSolid=col.replace(/[\d.]+\)$/,'0.85)');
+    ctx.fillStyle=colSolid;ctx.font='9px Space Mono,monospace';
+    ctx.textAlign='right';ctx.textBaseline='bottom';
+    ctx.fillText(`${lbl}  ${sym()}${price.toFixed(2)}`,W-PR-4,y-1);
+    ctx.restore();
+  });
 }
 
 function drawRSI(full, vS, vE){
@@ -824,19 +1298,35 @@ function setupZoom(){
   wrap.addEventListener('mouseup',e=>{
     if(dragStart===null) return;
     if(dragging){
-      const rect=wrap.getBoundingClientRect(), cW=wrap.clientWidth-8-62;
+      const rect=wrap.getBoundingClientRect();
+      const cW=Math.max(1, wrap.clientWidth-8-62);
       const dLen=viewEnd-viewStart;
-      const x1=dragStart-rect.left-8, x2=e.clientX-rect.left-8;
-      const i1=Math.max(0,Math.round(Math.min(x1,x2)/(cW/dLen)));
-      const i2=Math.min(dLen,Math.round(Math.max(x1,x2)/(cW/dLen))+1);
+      const x1=dragStart-rect.left-8;
+      const x2=e.clientX-rect.left-8;
+      const pxPerCandle=cW/dLen;
+      const i1=Math.max(0, Math.floor(Math.min(x1,x2)/pxPerCandle));
+      const i2=Math.min(dLen, Math.ceil(Math.max(x1,x2)/pxPerCandle));
       if(i2-i1>=4){
-        viewStart+=i1; viewEnd=viewStart+i2-i1;
+        viewStart=viewStart+i1;
+        viewEnd=viewStart+(i2-i1);
         document.getElementById('btnReset').style.display='';
-        document.getElementById('zoomHint').textContent='Zoom aktiv';
+        document.getElementById('zoomHint').textContent='Zoom aktiv — Reset zum Zurücksetzen';
         redraw();
       }
     }
     dragStart=null; dragging=false; box.style.display='none';
+  });
+  // Touch-Support für Mobile
+  wrap.addEventListener('touchstart',e=>{
+    if(!allCandles.length||e.touches.length!==1) return;
+    dragStart=e.touches[0].clientX; dragging=false;
+  },{passive:true});
+  wrap.addEventListener('touchmove',e=>{
+    if(dragStart===null||e.touches.length!==1) return;
+    if(Math.abs(e.touches[0].clientX-dragStart)>8) dragging=true;
+  },{passive:true});
+  wrap.addEventListener('touchend',e=>{
+    dragStart=null; dragging=false;
   });
   wrap.addEventListener('wheel',e=>{
     if(!allCandles.length) return; e.preventDefault();
