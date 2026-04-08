@@ -1108,7 +1108,11 @@ function drawCandles(data){
   // Fibonacci Retracements
   if(indicators.ew)drawFibonacci(ctx,data,tx,py,W,PT,PL,PR,cW,cH);
 
-  // MA 200 — nur im 5J-Chart sinnvoll (200 Tageskerzen nötig)
+  // Sichtbarkeit MA50/200 je nach Zeitraum und Indikator-Status
+  const showMA50  = indicators.ma50  && ['1M','3M','1Y','5Y'].includes(curRange);
+  const showMA200 = indicators.ma200 && ['3M','1Y','5Y'].includes(curRange);
+
+  // MA 200
   if(showMA200){
     const has=slMA200.some(v=>v!==null);
     if(!has){ctx.fillStyle='rgba(245,166,35,0.35)';ctx.font='10px Space Mono,monospace';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('MA 200: mind. 5J Daten benötigt',PL+cW/2,PT+20);}
